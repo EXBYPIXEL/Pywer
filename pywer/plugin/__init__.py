@@ -4,12 +4,21 @@ Provides packaging, virtual in-memory loading, lifecycle management,
 and runtime APIs for Bedrock server plugins.
 """
 
-from .base import PluginBase, PluginConfig, PluginLogger, PluginManifest
+from .base import (
+    PLUGIN_API_VERSION,
+    PluginBase,
+    PluginConfig,
+    PluginLogger,
+    PluginManifest,
+    api_version_supported,
+    parse_api_version,
+)
 from .compiler import PluginCompileError, PluginCompiler
 from .loader import PywerZipFinder, PywerZipLoader, VirtualPluginLoader
 from .manager import PluginManager
 
 __all__ = [
+    "PLUGIN_API_VERSION",
     "PluginBase",
     "PluginConfig",
     "PluginLogger",
@@ -20,4 +29,6 @@ __all__ = [
     "PywerZipLoader",
     "VirtualPluginLoader",
     "PluginManager",
+    "api_version_supported",
+    "parse_api_version",
 ]

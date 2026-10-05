@@ -256,6 +256,15 @@ class Session:
     MAX_SPLIT_PARTS = 8192
     SPLIT_TTL = 10.0
     MAX_ACK_RANGE = 4096  # sequences one range record may expand to
+    # A chunk build that fails may be transient (a lock, a memory spike) or
+    # permanent (nothing can produce that coord at all). A few delayed retries
+    # recover the first kind without making the player walk across a chunk
+    # boundary to force queue_chunks(), and a hard stop on the attempt count
+    # keeps the second kind from being resubmitted on every such crossing.
+    CHUNK_MAX_ATTEMPTS = 3  # one first try plus two retries
+    CHUNK_RETRY_DELAY = 1.0  # seconds before the first retry
+    CHUNK_RETRY_BACKOFF = 2.0  # multiplier applied to the delay after that
+    MAX_CHUNK_RETRIES = 256  # retries one session may hold pending at once
 
     @staticmethod
     def _extend_seq(wire, ref):
@@ -316,6 +325,8 @@ class Session:
         self.chunk_queue = []
         self.chunk_send_queue = []
         self.chunks_in_flight = set()
+        self.chunk_attempts = {}
+        self.chunk_retries = []
         self.center = None
         self.radius = 0
         self.sneaking = False
@@ -2678,14 +2689,101 @@ class Session:
                 return
         self.chunk_send_queue.append((cx, cz, payload))
 
+    def on_chunk_failed(self, cx, cz, error):
+        """Callback from background worker when a chunk could not be built.
+
+        Releases the in-flight slot queue_chunks() claimed before submitting the
+        job. Without this the coord stays claimed for the rest of the session and
+        queue_chunks() skips it forever, which is a permanently missing chunk.
+
+        The coord is then queued for a delayed retry instead of being re-queued
+        outright. Re-queueing outright resubmits a job that is failing for a
+        reason on every chunk boundary the player crosses, forever; doing nothing
+        at all leaves a hole under a player who never moves, because queue_chunks()
+        only runs on a boundary crossing or a spawn. A bounded number of retries
+        with a delay between them covers the transient case and then stops.
+        """
+        coord = (cx, cz)
+        self.chunks_in_flight.discard(coord)
+        attempts = self.chunk_attempts.get(coord, 0) + 1
+        self.chunk_attempts[coord] = attempts
+        log(
+            "Worker",
+            "chunk (%s, %s) build failed (attempt %d/%d): %r"
+            % (cx, cz, attempts, self.CHUNK_MAX_ATTEMPTS, error),
+        )
+        if attempts >= self.CHUNK_MAX_ATTEMPTS:
+            log("Worker", "giving up on chunk (%s, %s)" % (cx, cz))
+            return
+        if len(self.chunk_retries) >= self.MAX_CHUNK_RETRIES:
+            return
+        delay = self.CHUNK_RETRY_DELAY * (self.CHUNK_RETRY_BACKOFF ** (attempts - 1))
+        self.chunk_retries.append((time.time() + delay, cx, cz))
+
+    def _flush_chunk_retries(self):
+        """Resubmit failed coords whose retry delay has elapsed.
+
+        Runs once per tick from stream_chunks(), so a retry costs nothing while
+        nothing is waiting. A coord that has meanwhile been sent, is in flight
+        again, or has drifted out of range is dropped rather than resubmitted -
+        it is not lost, queue_chunks() will ask for it when it comes back into
+        range or the player crosses back into its chunk.
+        """
+        if not self.chunk_retries:
+            return
+        now = time.time()
+        due = [entry for entry in self.chunk_retries if entry[0] <= now]
+        if not due:
+            return
+        self.chunk_retries = [entry for entry in self.chunk_retries if entry[0] > now]
+        cache = getattr(self.srv, "chunk_cache", None)
+        worker_pool = getattr(self.srv, "worker_pool", None)
+        for _ready_at, cx, cz in due:
+            coord = (cx, cz)
+            if coord in self.chunks_in_flight or coord in self.sent_chunks:
+                continue
+            if self.center is not None and (
+                abs(cx - self.center[0]) > self.radius + 2
+                or abs(cz - self.center[1]) > self.radius + 2
+            ):
+                continue
+            self._request_chunk(cx, cz, cache, worker_pool)
+
+    def _request_chunk(self, x, z, cache, worker_pool):
+        """Put one coord into chunk_send_queue, from cache, worker or in-process."""
+        cached = cache.get(x, z) if cache else None
+        if cached is not None:
+            self.chunk_send_queue.append((x, z, cached))
+        elif worker_pool:
+            self.chunks_in_flight.add((x, z))
+            worker_pool.submit("CHUNK", self.rid, _build_chunk_job, x, z)
+        else:
+            payload = build_chunk(x, z)
+            if cache:
+                cache.put(x, z, payload)
+            self.chunk_send_queue.append((x, z, payload))
+
     def queue_chunks(self):
         cx, cz = self.center
         r = self.radius
+        # Attempt counts are only interesting while the coord is in range.
+        # Forgetting the rest keeps the table bounded over a long session and
+        # gives a coord the player has left for good a fresh set of attempts
+        # when they come back, long after whatever failed has had time to clear.
+        in_range = {
+            (x, z)
+            for x in range(cx - r - 2, cx + r + 3)
+            for z in range(cz - r - 2, cz + r + 3)
+        }
+        for coord in [c for c in self.chunk_attempts if c not in in_range]:
+            del self.chunk_attempts[coord]
         want = [
             (x, z)
             for x in range(cx - r, cx + r + 1)
             for z in range(cz - r, cz + r + 1)
-            if (x, z) not in self.sent_chunks and (x, z) not in self.chunks_in_flight
+            if (x, z) not in self.sent_chunks
+            and (x, z) not in self.chunks_in_flight
+            and self.chunk_attempts.get((x, z), 0) < self.CHUNK_MAX_ATTEMPTS
         ]
         self.chunk_queue = sorted(
             want, key=lambda c: (c[0] - cx) ** 2 + (c[1] - cz) ** 2
@@ -2694,25 +2792,14 @@ class Session:
         worker_pool = getattr(self.srv, "worker_pool", None)
         to_remove = []
         for x, z in self.chunk_queue:
-            cached = cache.get(x, z) if cache else None
-            if cached is not None:
-                self.chunk_send_queue.append((x, z, cached))
-                to_remove.append((x, z))
-            elif worker_pool:
-                self.chunks_in_flight.add((x, z))
-                worker_pool.submit("CHUNK", self.rid, _build_chunk_job, x, z)
-                to_remove.append((x, z))
-            else:
-                payload = build_chunk(x, z)
-                if cache:
-                    cache.put(x, z, payload)
-                self.chunk_send_queue.append((x, z, payload))
-                to_remove.append((x, z))
+            self._request_chunk(x, z, cache, worker_pool)
+            to_remove.append((x, z))
         for item in to_remove:
             self.chunk_queue.remove(item)
 
     def stream_chunks(self):
         """Send ready-to-send chunks and monitor position for new chunk loads."""
+        self._flush_chunk_retries()
         c = (math.floor(self.pos[0]) >> 4, math.floor(self.pos[2]) >> 4)
         if c != self.center:
             self.center = c

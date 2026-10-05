@@ -39,7 +39,7 @@ from ..packets.text import build_text
 from ..player.movement import NETWORK_EYE_OFFSET
 from ..player.session import Session
 from ..event import manager as events, PlayerJoinEvent, PlayerQuitEvent, ServerLoadEvent, ServerStopEvent
-from .worker import WorkerPool
+from .worker import WorkerFailure, WorkerPool
 from ..entity.manager import EntityManager, resolve_actor
 from ..world.cache import ChunkCache
 from ..scheduler import ServerScheduler
@@ -439,16 +439,60 @@ class Server:
         log("Player", "%s left" % p.name)
 
     def drain_workers(self):
-        """Drain completed worker results and dispatch to active sessions."""
-        for task_type, session_id, res in self.worker_pool.drain_results():
-            if task_type == "CHUNK":
-                cx, cz, payload = res
-                self.chunk_cache.put(cx, cz, payload)
-                for s in self.sessions.values():
-                    if s.rid == session_id:
-                        if hasattr(s, "on_chunk_ready"):
-                            s.on_chunk_ready(cx, cz, payload)
-                        break
+        """Drain completed worker results and dispatch to active sessions.
+
+        Each result is handled in isolation. A failed or malformed job must not
+        drop the rest of the drained batch, and it must never escape into tick(),
+        where an unhandled exception would take the whole server down.
+        """
+        for item in self.worker_pool.drain_results():
+            try:
+                self._dispatch_worker(item)
+            except Exception as e:
+                log("Worker", "error dispatching %r: %r" % (item, e))
+
+    def _dispatch_worker(self, item):
+        task_type, session_id, res = item
+
+        if isinstance(res, WorkerFailure):
+            # A failure for a type this server does not consume is still reported
+            # here. A chunk failure is reported by the session that owns the slot,
+            # so that it is not logged twice or dropped when the player is gone.
+            session = self._session_by_id(session_id) if task_type == "CHUNK" else None
+            if session is not None and len(res.args) == 2:
+                if hasattr(session, "on_chunk_failed"):
+                    session.on_chunk_failed(res.args[0], res.args[1], res.error)
+                    return
+            log("Worker", "task %s for session %s failed: %r" % (task_type, session_id, res.error))
+            return
+
+        if task_type != "CHUNK":
+            # Failures are reported above for every task type; a success that
+            # nothing consumes is the same blind spot from the other side. Chunk
+            # jobs are the only ones submitted today, so this should never fire -
+            # which is exactly why it must not be silent when it does.
+            log(
+                "Worker",
+                "no handler for successful task %s (session %s)" % (task_type, session_id),
+            )
+            return
+        cx, cz, payload = res
+        try:
+            self.chunk_cache.put(cx, cz, payload)
+        except Exception as e:
+            # The cache is an optimisation; losing one entry must not cost the
+            # session its chunk, which is still delivered below.
+            log("Worker", "could not cache chunk (%s, %s): %r" % (cx, cz, e))
+        session = self._session_by_id(session_id)
+        if session is not None and hasattr(session, "on_chunk_ready"):
+            session.on_chunk_ready(cx, cz, payload)
+
+    def _session_by_id(self, session_id):
+        """The connected session with this session id, or None if it has gone away."""
+        for s in self.sessions.values():
+            if s.rid == session_id:
+                return s
+        return None
 
     def drain_socket(self):
         """Drain all pending UDP datagrams in non-blocking mode."""
