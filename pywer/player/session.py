@@ -847,10 +847,16 @@ class Session:
         self.last_rx = time.time()
         if self.state == "CLOSED":
             return
+        # RakNet ORs the datagram bit (0x80) into both control packets, so the two are
+        # told apart by the flags a real peer sets: ACK = 0x80|0x40, NACK = 0x80|0x20.
+        # Swapping them is silent in an all-Pywer test bed - the labels move together -
+        # but against a spec peer an ACK lands in _on_nack, which retransmits instead of
+        # retiring the datagram, and a NACK lands in _on_ack, which drops the pending
+        # entry the gap report was asking us to fill.
         kind = data[0] & 0xE0
-        if kind == 0xA0:  # RakNet ID_ACK
+        if kind == 0xC0:  # ACK
             return self._on_ack(data)
-        if kind == 0xC0:  # RakNet ID_NACK
+        if kind == 0xA0:  # NACK
             return self._on_nack(data)
         r = ByteReader(data, 1)
         seq = self._extend_seq(r.read_u24_le(), self.max_seq)
@@ -985,13 +991,15 @@ class Session:
                 self.attack_time -= 1
             if self.hurt_time > 0:
                 self.hurt_time -= 1
-        # RakNet: 0xA0 acknowledges, 0xC0 reports a gap the sender must fill.
+        # RakNet: 0xC0 acknowledges, 0xA0 reports a gap the sender must fill. These two
+        # bytes are what a spec peer switches on when it decides whether to retire a
+        # datagram or retransmit it, so they have to be the ones set in on_datagram.
         if self.ack_q:
-            for pk in self._ackpkts(0xA0, self.ack_q):
+            for pk in self._ackpkts(0xC0, self.ack_q):
                 self._udp(pk)
             self.ack_q = []
         if self.nack_q:
-            for pk in self._ackpkts(0xC0, self.nack_q):
+            for pk in self._ackpkts(0xA0, self.nack_q):
                 self._udp(pk)
             self.nack_q = []
         # Expiring entries are retried on a per-packet backoff and capped per tick: a

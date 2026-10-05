@@ -4,6 +4,11 @@ These cover the transport invariants the rest of the server depends on: the ACK/
 direction on both the receive and transmit side, retransmission reusing its original
 sequence number, 24-bit counter wrap, and the resource ceilings that keep a single
 peer from growing server state without bound.
+
+ACK and NACK are named here rather than written as hex literals because both sides of
+the transport have to agree with every other RakNet implementation, not just with each
+other: a suite where Pywer sends and reads the same swapped bytes passes while every
+spec peer is interpreted backwards.
 """
 
 import struct
@@ -11,6 +16,11 @@ import time
 import unittest
 
 from pywer.player.session import Session
+
+# RakNet ORs the datagram bit (0x80) into both control packets and tells them apart
+# with two extra flags (see go-raknet packet.go: bitFlagACK 0x40, bitFlagNACK 0x20).
+ACK = 0xC0
+NACK = 0xA0
 
 
 class FakeServer:
@@ -84,7 +94,7 @@ class TestAckNackDirection(unittest.TestCase):
     def test_ack_does_not_retransmit(self):
         s, srv = make_session()
         s._send_datagram([b"frame"])
-        s.on_datagram(record_packet(0xA0, [0]))
+        s.on_datagram(record_packet(ACK, [0]))
         self.assertEqual(s.pending, {})
         s.tick(time.time())
         self.assertEqual(srv.sent, [data_datagram(0, [b"frame"])])
@@ -93,7 +103,7 @@ class TestAckNackDirection(unittest.TestCase):
         s, srv = make_session()
         s._send_datagram([b"first"])
         s._send_datagram([b"second"])
-        s.on_datagram(record_packet(0xC0, [0]))
+        s.on_datagram(record_packet(NACK, [0]))
         self.assertIn(0, s.pending)
         self.assertIn(1, s.pending)
         self.assertEqual(srv.sent[-1], data_datagram(0, [b"first"]))
@@ -103,8 +113,8 @@ class TestAckNackDirection(unittest.TestCase):
         s.on_datagram(data_datagram(0, [reliable_frame(b"a", 0)]))
         s.on_datagram(data_datagram(3, [reliable_frame(b"b", 1)]))
         s.tick(time.time())
-        acks = [d for d in srv.sent if d[0] == 0xA0]
-        nacks = [d for d in srv.sent if d[0] == 0xC0]
+        acks = [d for d in srv.sent if d[0] == ACK]
+        nacks = [d for d in srv.sent if d[0] == NACK]
         self.assertEqual(len(acks), 1)
         self.assertEqual(len(nacks), 1)
         self.assertEqual(sorted(Session._records(None, acks[0])), [0, 3])
@@ -153,6 +163,35 @@ class TestAckNackDirection(unittest.TestCase):
         s.tick(time.time())
         self.assertEqual(s.state, "CLOSED")
 
+    def test_wire_flag_bytes_are_the_raknet_spec_ones(self):
+        # go-raknet packet.go sets bitFlagACK = 0b01000000 and bitFlagNACK = 0b00100000
+        # and ORs the datagram bit into both, then conn.go switches on those two bits.
+        # Pywer reads and writes both, so a swap round-trips perfectly between two Pywer
+        # ends and only misbehaves against every other RakNet implementation: a spec
+        # ACK would be read as a NACK (retransmit forever, pending never retires) and a
+        # spec NACK as an ACK (the lost datagram is never sent again).
+        s, srv = make_session()
+        s.on_datagram(data_datagram(0, [reliable_frame(b"a", 0)]))
+        s.on_datagram(data_datagram(5, [reliable_frame(b"b", 1)]))
+        s.tick(time.time())
+        flags = [d[0] for d in srv.sent]
+        self.assertEqual(flags.count(ACK), 1, "received sequences must be ACKed with 0xC0")
+        self.assertEqual(flags.count(NACK), 1, "the 1..4 gap must be NACKed with 0xA0")
+
+        s.pending[0] = (time.time() - 100.0, [b"x"], 0)
+        s.on_datagram(record_packet(ACK, [0]))
+        self.assertEqual(s.pending, {})
+        before = len(srv.sent)
+        s.tick(time.time())
+        self.assertEqual(len(srv.sent), before, "an ACKed datagram must not be retransmitted")
+
+        s.pending[1] = (time.time() - 100.0, [b"x"], 0)
+        before = len(srv.sent)
+        s.on_datagram(record_packet(NACK, [1]))
+        self.assertEqual(len(srv.sent), before + 1, "a NACK must retransmit immediately")
+        self.assertEqual(srv.sent[-1], data_datagram(1, [b"x"]))
+        self.assertIn(1, s.pending)
+
 
 class TestAckPacketEncoding(unittest.TestCase):
     def test_ack_datagrams_stay_within_the_mtu(self):
@@ -160,7 +199,7 @@ class TestAckPacketEncoding(unittest.TestCase):
         # dropped by the path MTU and cost the peer every retransmission it saves.
         s, _ = make_session()
         seqs = list(range(0, 2000, 2))
-        pks = s._ackpkts(0xA0, seqs)
+        pks = s._ackpkts(ACK, seqs)
         self.assertGreater(len(pks), 1)
         for pk in pks:
             self.assertLessEqual(len(pk), s.mtu - 28)
@@ -169,15 +208,15 @@ class TestAckPacketEncoding(unittest.TestCase):
 
     def test_ack_keeps_contiguous_sequences_in_one_datagram(self):
         s, _ = make_session()
-        pks = s._ackpkts(0xA0, list(range(500)))
+        pks = s._ackpkts(ACK, list(range(500)))
         self.assertEqual(len(pks), 1)
         self.assertEqual(Session._records(None, pks[0]), list(range(500)))
 
     def test_nack_is_split_too(self):
         s, _ = make_session()
-        pks = s._ackpkts(0xC0, list(range(0, 4000, 2)))
+        pks = s._ackpkts(NACK, list(range(0, 4000, 2)))
         for pk in pks:
-            self.assertEqual(pk[0], 0xC0)
+            self.assertEqual(pk[0], NACK)
             self.assertLessEqual(len(pk), s.mtu - 28)
 
 
@@ -204,12 +243,12 @@ class TestSequenceWrap(unittest.TestCase):
         s, srv = make_session()
         s.send_seq = 0x1000001
         s.pending[0xFFFFFF] = (time.time(), [b"frame"], 0)
-        s.on_datagram(record_packet(0xA0, [0xFFFFFF]))
+        s.on_datagram(record_packet(ACK, [0xFFFFFF]))
         self.assertNotIn(0xFFFFFF, s.pending)
 
     def test_ackpkt_never_straddles_the_wrap(self):
         s, _ = make_session()
-        pks = s._ackpkts(0xA0, [0xFFFFFF, 0x1000000, 0x1000001])
+        pks = s._ackpkts(ACK, [0xFFFFFF, 0x1000000, 0x1000001])
         decoded = sorted({v for pk in pks for v in Session._records(None, pk)})
         self.assertEqual(decoded, [0, 1, 0xFFFFFF])
 
@@ -217,17 +256,17 @@ class TestSequenceWrap(unittest.TestCase):
         # range(0xFFFFFE, 2) is empty, so a wrapped range used to drop every ack in it
         # and the peer retransmitted the whole window for nothing.
         rec = b"\x00" + (0xFFFFFE).to_bytes(3, "little") + (0x000001).to_bytes(3, "little")
-        pkt = bytes([0xA0]) + struct.pack(">H", 1) + rec
+        pkt = bytes([ACK]) + struct.pack(">H", 1) + rec
         self.assertEqual(Session._records(None, pkt), [0xFFFFFE, 0xFFFFFF, 0, 1])
 
     def test_oversized_range_is_capped(self):
         rec = b"\x00" + (0).to_bytes(3, "little") + (0xFFFFFF).to_bytes(3, "little")
-        pkt = bytes([0xA0]) + struct.pack(">H", 1) + rec
+        pkt = bytes([ACK]) + struct.pack(">H", 1) + rec
         self.assertEqual(len(Session._records(None, pkt)), Session.MAX_ACK_RANGE)
 
     def test_oversized_wrapped_range_is_capped(self):
         rec = b"\x00" + (0xFFFFFF).to_bytes(3, "little") + (0x00FFFE).to_bytes(3, "little")
-        pkt = bytes([0xA0]) + struct.pack(">H", 1) + rec
+        pkt = bytes([ACK]) + struct.pack(">H", 1) + rec
         self.assertLessEqual(len(Session._records(None, pkt)), Session.MAX_ACK_RANGE)
 
     def test_ordering_delivers_across_wrap(self):
@@ -274,7 +313,7 @@ class TestResourceCeilings(unittest.TestCase):
     def test_ack_arrival_resets_the_stall_clock(self):
         s, _ = make_session()
         s.last_ack_at = time.time() - (s.ACK_STALL_TIMEOUT + 1)
-        s.on_datagram(record_packet(0xA0, [0xFFFFFF]))
+        s.on_datagram(record_packet(ACK, [0xFFFFFF]))
         self.assertLess(time.time() - s.last_ack_at, s.ACK_STALL_TIMEOUT)
 
     def test_closed_session_stops_sending(self):

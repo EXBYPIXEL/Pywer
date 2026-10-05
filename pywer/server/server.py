@@ -61,17 +61,31 @@ GAMEMODE_NAMES = {
 }
 
 
+def _motd_title():
+    """Server name for the pong, made safe to splice into the ';'-delimited reply.
+
+    The client splits the pong on ';' to read its 12 fields, so a title carrying one
+    shifts every field after it and the entry never parses. CR/LF would do the same to
+    anything that logs the reply, and the cap keeps the response bounded no matter what
+    the config file holds.
+    """
+    title = "".join(
+        ch if ch not in ";\r\n" else " " for ch in str(config.SERVER_TITLE or "")
+    ).strip()
+    return title[:128] or "pywer-v%s" % __version__
+
+
 def build_motd(guid, port, online=0):
     """Unconnected ping response.
 
     Every advertised value comes from its own source of truth instead of a literal:
     the game mode from config.GAMEMODE, the player limit from config.MAX_PLAYERS, the
-    version from pywer.__version__, and the online count from the caller so the server
-    list can never disagree with what the server is actually running or hosting.
+    server name from config.SERVER_TITLE, and the online count from the caller so the
+    server list can never disagree with what the server is actually running or hosting.
     """
     mode = config.GAMEMODE & 0x7
-    return "MCPE;pywer-v%s;%d;%s;%d;%d;%d;Minimal;%s;%d;%d;%d;" % (
-        __version__,
+    return "MCPE;%s;%d;%s;%d;%d;%d;Minimal;%s;%d;%d;%d;" % (
+        _motd_title(),
         config.PROTOCOL,
         config.GAME_VERSION,
         max(0, int(online)),
@@ -212,6 +226,12 @@ class Server:
     def unconnected(self, data, addr):
         pid = data[0]
         if pid in (0x01, 0x02):
+            # The ping time is echoed back verbatim and the client matches it against
+            # the time it sent. A truncated one produces a pong that is short of the
+            # 8-byte echo, which no client will accept, so drop the ping instead of
+            # answering with something malformed.
+            if len(data) < 9:
+                return
             t = data[1:9]
             # Built per ping: the online count has to track the live session table, and
             # a string frozen in __init__ advertised "0 players" for the rest of the run.
@@ -221,15 +241,27 @@ class Server:
                 addr,
             )
         elif pid == 0x05:
-            if data[1:17] != RAKNET_MAGIC:
+            if len(data) < 17 or data[1:17] != RAKNET_MAGIC:
                 return
             mtu = max(576, min(len(data) + 28, 1492))
             self.send(b"\x06" + RAKNET_MAGIC + struct.pack(">QBH", self.guid, 0, mtu), addr)
         elif pid == 0x07:
+            # packet id + magic, then the address, then the MTU and client GUID the
+            # reader pulls next. Anything shorter is not an OpenConnectionRequest2, so
+            # reject it before the reader walks past the end of the packet. The magic is
+            # checked for the same reason it is checked on 0x05: both halves of the
+            # handshake carry it, and a peer that got this far already proved it sends
+            # the right one.
+            if len(data) < 18 or data[1:17] != RAKNET_MAGIC:
+                return
             r = ByteReader(data, 17)
             if r.read_u8() == 4:
+                if len(data) < 18 + 6 + 2 + 8:
+                    return
                 r.read_bytes(6)
             else:
+                if len(data) < 18 + 28 + 2 + 8:
+                    return
                 r.read_bytes(28)
             mtu = r.read_u16_be()
             cguid = r.read_u64_be()
